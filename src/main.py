@@ -1,8 +1,9 @@
 import datetime
+import io
 import os
 import pathlib
-import time
-from argparse import ArgumentParser, RawTextHelpFormatter
+from argparse import ArgumentParser, ArgumentDefaultsHelpFormatter
+from tqdm import tqdm
 
 import matplotlib.pyplot as plt
 
@@ -23,15 +24,8 @@ from model import Generator, Discriminator
 from utils import create_gif
 
 
-# checkpoint_dir = '../training_checkpoints/'
-# checkpoint_prefix = os.path.join(checkpoint_dir, "ckpt")
-# checkpoint = tf.train.Checkpoint(generator_optimizer=generator.optimizer(),
-#                                  discriminator_optimizer=discriminator.optimizer(),
-#                                  generator=generator.get_model(),
-#                                  discriminator=discriminator.get_model())
-
 def get_args():
-    parser = ArgumentParser(allow_abbrev=False, description='', formatter_class=RawTextHelpFormatter)
+    parser = ArgumentParser(allow_abbrev=False, description='', formatter_class=ArgumentDefaultsHelpFormatter)
 
     parser.add_argument('-b', '--batch_size', type=int, help='Batch size for the training dataset.', default=256)
     parser.add_argument('-e', '--epochs', type=int, help='Amount of epochs to train model.', default=1)
@@ -53,7 +47,7 @@ def load_dataset(buffer_size, batch_size):
     return tf.data.Dataset.from_tensor_slices(train_images).shuffle(buffer_size).batch(batch_size)
 
 
-def generate_and_save_images(model, epoch, test_input, img_path):
+def generate_and_save_images(model, test_input, epoch=None, img_path=None):
     predictions = model(test_input, training=False)
 
     fig = plt.figure(figsize=(4, 4))
@@ -63,8 +57,27 @@ def generate_and_save_images(model, epoch, test_input, img_path):
         plt.imshow(predictions[i, :, :, 0] * 127.5 + 127.5, cmap='gray')
         plt.axis('off')
 
-    plt.savefig('{}/image_at_epoch_{:04d}.png'.format(img_path, epoch))
+    if epoch is not None and img_path is not None:
+        plt.savefig('{}/image_at_epoch_{:04d}.png'.format(img_path, epoch))
+
+    # Step needed to be compatible with tensorboard
+    buf = io.BytesIO()
+    plt.savefig(buf, format='png')
     plt.close(fig)
+    buf.seek(0)
+
+    image = tf.image.decode_png(buf.getvalue(), channels=4)
+    image = tf.expand_dims(image, 0)
+
+    return image
+
+
+def write_tensorboard_logs(file_writer, label, content, step, content_type='scalar'):
+    with file_writer.as_default():
+        if content_type == 'scalar':
+            tf.summary.scalar(label, content, step=step)
+        elif content_type == 'image':
+            tf.summary.image(label, content, step=step)
 
 
 @tf.function
@@ -86,28 +99,46 @@ def train_step(generator, discriminator, images, batch_size, noise_dim):
     generator.optimizer().apply_gradients(zip(gradients_of_generator, generator.get_model().trainable_variables))
     discriminator.optimizer().apply_gradients(zip(gradients_of_discriminator, discriminator.get_model().trainable_variables))
 
+    return disc_loss, gen_loss
 
-def train(generator, discriminator, dataset, img_path, epochs, batch_size, num_generate, noise_dim):
-    print("\n---------- Starting training loop... ----------\n")
+
+def train(generator, discriminator, dataset, img_path, epochs, batch_size, num_generate, noise_dim, discriminator_file_writer, generator_file_writer):
+    tqdm.write("\n---------- Starting training loop... ----------\n")
 
     seed = tf.random.normal([num_generate, noise_dim])
+    generator_loss_hist = []
+    discriminator_loss_hist = []
+    step = 0
 
     for epoch in range(epochs):
-        start = time.time()
+        tqdm.write('Epoch: {}/{}'.format(epoch + 1, epochs))
 
-        for image_batch in dataset:
-            train_step(generator, discriminator, image_batch, batch_size, noise_dim)
+        for batch_index, image_batch in enumerate(tqdm(dataset)):
+            disc_loss, gen_loss = train_step(generator, discriminator, image_batch, batch_size, noise_dim)
+
+            discriminator_loss_hist.append(disc_loss)
+            generator_loss_hist.append(gen_loss)
+
+            if batch_index % 100 == 0 and batch_index > 0:
+                write_tensorboard_logs(discriminator_file_writer, 'Loss', tf.reduce_mean(discriminator_loss_hist), step, 'scalar')
+                write_tensorboard_logs(generator_file_writer, 'Loss', tf.reduce_mean(generator_loss_hist), step, 'scalar')
+
+                write_tensorboard_logs(generator_file_writer, 'Generated Images', generate_and_save_images(generator.get_model(), seed), step,
+                                       'image')
+
+                step += 1
 
         # Produce images for the GIF as you go
-        generate_and_save_images(generator.get_model(), epoch + 1, seed, img_path)
+        generate_and_save_images(generator.get_model(), seed, epoch + 1, img_path)
 
-        # Save the model every 15 epochs
-        # if (epoch + 1) % 15 == 0:
-        #     checkpoint.save(file_prefix=checkpoint_prefix)
+        tqdm.write(('Discriminator Loss: {:.4f} - Generator Loss: {:.4f}'.format(
+            tf.reduce_mean(discriminator_loss_hist), tf.reduce_mean(generator_loss_hist)))
+        )
 
-        print('Epoch: {}/{} - Time: {:.2f} seconds'.format(epoch + 1, epochs, time.time() - start))
+        generator_loss_hist.clear()
+        discriminator_loss_hist.clear()
 
-    print("\n---------- Training loop finished. ----------\n")
+    tqdm.write("\n---------- Training loop finished. ----------\n")
 
 
 def main():
@@ -115,8 +146,17 @@ def main():
     args = get_args()
 
     # Create directory for images
-    img_path = pathlib.Path(__file__).resolve().parents[1] / pathlib.Path("img") / datetime.datetime.now().strftime("%Y-%m-%dT%H-%M-%S")
+    current_time = datetime.datetime.now().strftime("%Y-%m-%dT%H-%M-%S")
+
+    img_path = pathlib.Path(__file__).resolve().parents[1] / pathlib.Path("img") / current_time
     img_path.mkdir(parents=True)
+
+    # Tensorboard file writer for training logs
+    discriminator_log_dir = "logs/{}/discriminator/".format(current_time)
+    generator_log_dir = "logs/{}/generator/".format(current_time)
+
+    discriminator_file_writer = tf.summary.create_file_writer(discriminator_log_dir)
+    generator_file_writer = tf.summary.create_file_writer(generator_log_dir)
 
     # Create Generator and Discriminator models
     generator = Generator(learning_rate=args['learning_rate'])
@@ -131,7 +171,9 @@ def main():
           args['epochs'],
           args['batch_size'],
           args['num_generate'],
-          args['noise_dim'])
+          args['noise_dim'],
+          discriminator_file_writer,
+          generator_file_writer)
 
     # Create gif from all images created during training
     create_gif('{}/dcgan.gif'.format(img_path), '{}/image*.png'.format(img_path), delete_file=True)
